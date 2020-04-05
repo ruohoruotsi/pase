@@ -1,18 +1,19 @@
 import json
-import librosa
+#import librosa
 import argparse
 import random
 from random import shuffle
 import numpy as np
+import soundfile as sf
 import os
 
 def get_file_dur(fname):
-    x, rate = librosa.load(fname, sr=None)
+    x, rate = sf.read(fname)
     return len(x)
 
 def main(opts):
     random.seed(opts.seed)
-    spk2idx = np.load(opts.libri_dict)
+    spk2idx = np.load(opts.libri_dict, allow_pickle=True)
     spk2idx = dict(spk2idx.any())
     data_cfg = {'train':{'data':[],
                          'speakers':[]},
@@ -24,9 +25,10 @@ def main(opts):
     with open(opts.train_scp, 'r') as train_f:
         train_files = [l.rstrip() for l in train_f]
         shuffle(train_files)
-        N_valid_files = int(len(train_files) * opts.val_ratio)
-        valid_files = train_files[:N_valid_files]
-        train_files = train_files[N_valid_files:]
+        if opts.valid_scp is None:
+            N_valid_files = int(len(train_files) * opts.val_ratio)
+            valid_files = train_files[:N_valid_files]
+            train_files = train_files[N_valid_files:]
         train_dur = 0
         for ti, train_file in enumerate(train_files, start=1):
             print('Processing train file {:7d}/{:7d}'.format(ti,
@@ -42,22 +44,41 @@ def main(opts):
                                                    train_file))
         data_cfg['train']['total_wav_dur'] = train_dur
         print()
+        if opts.valid_scp is None:
+            valid_dur = 0
+            for ti, valid_file in enumerate(valid_files, start=1):
+                print('Processing valid file {:7d}/{:7d}'.format(ti,
+                                                                 len(valid_files)),
+                      end='\r')
+                spk = spk2idx[valid_file]
+                if spk not in data_cfg['speakers']:
+                    data_cfg['speakers'].append(spk)
+                    data_cfg['valid']['speakers'].append(spk)
+                data_cfg['valid']['data'].append({'filename':valid_file,
+                                                  'spk':spk})
+                valid_dur += get_file_dur(os.path.join(opts.data_root,
+                                                       valid_file))
+            data_cfg['valid']['total_wav_dur'] = valid_dur
+            print()
 
-        valid_dur = 0
-        for ti, valid_file in enumerate(valid_files, start=1):
-            print('Processing valid file {:7d}/{:7d}'.format(ti,
-                                                             len(valid_files)),
-                  end='\r')
-            spk = spk2idx[valid_file]
-            if spk not in data_cfg['speakers']:
-                data_cfg['speakers'].append(spk)
-                data_cfg['valid']['speakers'].append(spk)
-            data_cfg['valid']['data'].append({'filename':valid_file,
-                                              'spk':spk})
-            valid_dur += get_file_dur(os.path.join(opts.data_root,
-                                                   valid_file))
-        data_cfg['valid']['total_wav_dur'] = valid_dur
-        print()
+    if opts.valid_scp is not None:
+        with open(opts.valid_scp, 'r') as valid_f:
+            valid_files = [l.rstrip() for l in valid_f]
+            valid_dur = 0
+            for ti, valid_file in enumerate(valid_files, start=1):
+                print('Processing valid file {:7d}/{:7d}'.format(ti,
+                                                                 len(valid_files)),
+                      end='\r')
+                spk = spk2idx[valid_file]
+                if spk not in data_cfg['speakers']:
+                    data_cfg['speakers'].append(spk)
+                    data_cfg['valid']['speakers'].append(spk)
+                data_cfg['valid']['data'].append({'filename':valid_file,
+                                                  'spk':spk})
+                valid_dur += get_file_dur(os.path.join(opts.data_root,
+                                                       valid_file))
+            data_cfg['valid']['total_wav_dur'] = valid_dur
+            print()
 
     with open(opts.test_scp, 'r') as test_f:
         test_files = [l.rstrip() for l in test_f]
@@ -89,6 +110,7 @@ if __name__ == '__main__':
     parser.add_argument('--data_root', type=str, 
                         default='data/LibriSpeech/Librispeech_spkid_sel')
     parser.add_argument('--train_scp', type=str, default=None)
+    parser.add_argument('--valid_scp', type=str, default=None)
     parser.add_argument('--test_scp', type=str, default=None)
     parser.add_argument('--val_ratio', type=float, default=0.1,
                         help='Validation ratio to take out of training '

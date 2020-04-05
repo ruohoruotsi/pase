@@ -11,13 +11,13 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from ahoproc_tools.io import read_aco_file
-import os
-from waveminionet.models.frontend import WaveFe, wf_builder
-from waveminionet.models.modules import Model
+from pase.models.frontend import wf_builder
+from pase.models.modules import Model
 import librosa
 from random import shuffle
 import argparse
 from utils import *
+import os
 
 
 # Make Linear classifier model
@@ -115,6 +115,7 @@ class MLPClassifier(Model):
                  num_spks=None,
                  ft_fe=False,
                  hidden_size=2048,
+                 hidden_layers=1,
                  z_bnorm=False,
                  name='MLP'):
         # 2048 default size raises 5.6M params
@@ -128,13 +129,16 @@ class MLPClassifier(Model):
             self.z_bnorm = nn.BatchNorm1d(frontend.emb_dim, affine=False)
         if num_spks is None:
             raise ValueError('Please specify a number of spks.')
-        self.model = nn.Sequential(
-            nn.Conv1d(frontend.emb_dim, hidden_size, 1),
-            nn.LeakyReLU(),
-            nn.BatchNorm1d(hidden_size),
-            nn.Conv1d(hidden_size, num_spks, 1),
-            nn.LogSoftmax(dim=1)
-        )
+        layers = [nn.Conv1d(frontend.emb_dim, hidden_size, 1),
+                  nn.LeakyReLU(),
+                  nn.BatchNorm1d(hidden_size)]
+        for n in range(1, hidden_layers):
+            layers += [nn.Conv1d(hidden_size, hidden_size, 1),
+                       nn.LeakyReLU(),
+                       nn.BatchNorm1d(hidden_size)]
+        layers += [nn.Conv1d(hidden_size, num_spks, 1),
+                   nn.LogSoftmax(dim=1)]
+        self.model = nn.Sequential(*layers)
 
     def forward(self, x):
         h = self.frontend(x)
@@ -152,6 +156,7 @@ class RNNClassifier(Model):
                  hidden_size=1300,
                  z_bnorm=False,
                  uni=False,
+                 return_sequence=False,
                  name='RNN'):
         # 1300 default size raises 5.25M params
         super().__init__(name=name, max_ckpts=1000)
@@ -175,6 +180,8 @@ class RNNClassifier(Model):
             nn.Conv1d(hidden_size, num_spks, 1),
             nn.LogSoftmax(dim=1)
         )
+        self.return_sequence = return_sequence
+        self.uni = uni
 
     def forward(self, x):
         h = self.frontend(x)
@@ -183,7 +190,22 @@ class RNNClassifier(Model):
         if hasattr(self, 'z_bnorm'):
             h = self.z_bnorm(h)
         ht, state = self.rnn(h.transpose(1, 2))
-        y = self.model(ht.transpose(1, 2))
+        if self.return_sequence:
+            ht = ht.transpose(1, 2)
+        else:
+            if not self.uni:
+                # pick last time-step for each dir
+                # first chunk feat dim
+                bsz, slen, feats = ht.size()
+                ht = torch.chunk(ht.view(bsz, slen, 2, feats // 2), 2, dim=2)
+                # now select fwd
+                ht_fwd = ht[0][:, -1, 0, :].unsqueeze(2)
+                ht_bwd = ht[1][:, 0, 0, :].unsqueeze(2)
+                ht = torch.cat((ht_fwd, ht_bwd), dim=1)
+            else:
+                # just last time-step works
+                ht = ht[:, -1, :].unsqueeze(2)
+        y = self.model(ht)
         return y
 
 def select_model(opts, fe, num_spks):
@@ -193,6 +215,7 @@ def select_model(opts, fe, num_spks):
     elif opts.model == 'mlp':
         model = MLPClassifier(fe, num_spks=num_spks,
                               hidden_size=opts.hidden_size,
+                              hidden_layers=opts.hidden_layers,
                               ft_fe=opts.ft_fe,
                               z_bnorm=opts.z_bnorm)
     elif opts.model == 'rnn':
@@ -200,7 +223,8 @@ def select_model(opts, fe, num_spks):
                               hidden_size=opts.hidden_size,
                               ft_fe=opts.ft_fe,
                               z_bnorm=opts.z_bnorm,
-                              uni=opts.uni)
+                              uni=opts.uni,
+                              return_sequence=opts.return_sequence)
     else:
         raise TypeError('Unrecognized model {}'.format(opts.model))
     return model
@@ -237,28 +261,35 @@ def main(opts):
         # compute total samples dur
         beg_t = timeit.default_timer()
         tr_durs, sr = compute_utterances_durs(tr_files_, opts.data_root)
-        va_durs, _ = compute_utterances_durs(va_files, opts.data_root)
         train_dur = np.sum(tr_durs)
-        valid_dur = np.sum(va_durs)
         end_t = timeit.default_timer()
-        print('Read tr/va {:.1f} s/{:.1f} s in {} s'.format(train_dur / sr,
-                                                            valid_dur / sr,
-                                                            end_t - beg_t))
+        if len(va_files) > 0:
+            va_durs, _ = compute_utterances_durs(va_files, opts.data_root)
+            valid_dur = np.sum(va_durs)
+            print('Read tr/va {:.1f} s/{:.1f} s in {} s'.format(train_dur / sr,
+                                                                valid_dur / sr,
+                                                                end_t - beg_t))
+        else:
+            print('Read tr {:.1f} s in {} s'.format(train_dur / sr,
+                                                    end_t - beg_t))
+            opts.sched_mode='step'
         # Build Datasets
         dset = LibriSpkIDDataset(opts.data_root,
                                  tr_files_, spk2idx)
-        va_dset = LibriSpkIDDataset(opts.data_root,
-                                    va_files, spk2idx)
+        if len(va_files) > 0:
+            va_dset = LibriSpkIDDataset(opts.data_root,
+                                        va_files, spk2idx)
         cc = WavCollater(max_len=opts.max_len)
         #cc_vate = WavCollater(max_len=None)
         cc_vate = cc
         dloader = DataLoader(dset, batch_size=opts.batch_size, collate_fn=cc,
-                             shuffle=True)
-        va_dloader = DataLoader(va_dset, batch_size=opts.batch_size,
-                                collate_fn=cc_vate,
-                                shuffle=False)
+                             shuffle=True, num_workers=opts.num_workers)
+        if len(va_files) > 0:
+            va_dloader = DataLoader(va_dset, batch_size=opts.batch_size,
+                                    collate_fn=cc_vate,
+                                    shuffle=False)
+            va_bpe = (valid_dur // opts.max_len) // opts.batch_size
         tr_bpe = (train_dur // opts.max_len) // opts.batch_size
-        va_bpe = (valid_dur // opts.max_len) // opts.batch_size
         if opts.test_guia is not None:
             te_dset = LibriSpkIDDataset(opts.data_root,
                                         te_files, spk2idx)
@@ -288,20 +319,22 @@ def main(opts):
         for epoch in range(1, opts.epoch + 1):
             train_epoch(dloader, model, opt, epoch, opts.log_freq, writer=writer,
                         device=device, bpe=tr_bpe)
-            eloss, eacc = eval_epoch(va_dloader, model, epoch, opts.log_freq,
-                                     writer=writer, device=device, bpe=va_bpe,
-                                     key='valid')
-            if opts.sched_mode == 'step':
+            if len(va_files) > 0:
+                eloss, eacc = eval_epoch(va_dloader, model, epoch, opts.log_freq,
+                                         writer=writer, device=device, bpe=va_bpe,
+                                         key='valid')
+            if opts.sched_mode == 'step' or len(va_files) == 0:
                 sched.step()
             else:
                 sched.step(eacc)
-            if eacc > best_val_acc:
-                print('*' * 40)
-                print('New best val acc: {:.3f} => {:.3f}.'
-                      ''.format(best_val_acc, eacc))
-                print('*' * 40)
-                best_val_acc = eacc
-                best_val = True
+            if len(va_files) > 0:
+                if eacc > best_val_acc:
+                    print('*' * 40)
+                    print('New best val acc: {:.3f} => {:.3f}.'
+                          ''.format(best_val_acc, eacc))
+                    print('*' * 40)
+                    best_val_acc = eacc
+                    best_val = True
             model.save(opts.save_path, epoch - 1, best_val=best_val)
             best_val = False
             if opts.test_guia is not None:
@@ -371,7 +404,7 @@ def main(opts):
                                          ''.format(te_files[bidx - 1],
                                                    acc * 100,
                                                    100 - (acc * 100)))
-                    teacc.append(accuracy(Y_, Y))
+                    teacc.append(accuracy(Y_, Y).item())
                     teloss.append(loss.item())
                     end_t = timeit.default_timer()
                     timings.append(end_t - beg_t)
@@ -412,8 +445,13 @@ def train_epoch(dloader_, model, opt, epoch, log_freq=1, writer=None,
     timings = []
     beg_t = timeit.default_timer()
     #for bidx, batch in enumerate(dloader_, start=1):
+    iterator = iter(dloader_)
     for bidx in range(1, bpe + 1):
-        batch = next(dloader_.__iter__())
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            iterator = iter(dloader_)
+            batch = next(iterator)
         opt.zero_grad()
         X, Y, slens = batch
         #X = X.transpose(1, 2)
@@ -422,7 +460,7 @@ def train_epoch(dloader_, model, opt, epoch, log_freq=1, writer=None,
         Y = Y.to(device)
         Y_ = model(X)
         Y = Y.view(-1, 1).repeat(1, Y_.size(2))
-        loss = F.nll_loss(Y_.squeeze(-1), Y)
+        loss = F.nll_loss(Y_.squeeze(-1), Y.squeeze(-1))
         loss.backward()
         opt.step()
         end_t = timeit.default_timer()
@@ -455,8 +493,13 @@ def eval_epoch(dloader_, model, epoch, log_freq=1, writer=None, device='cpu',
         timings = []
         beg_t = timeit.default_timer()
         #for bidx, batch in enumerate(dloader_, start=1):
+        iterator = iter(dloader_)
         for bidx in range(1, bpe + 1):
-            batch = next(dloader_.__iter__())
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                iterator = iter(dloader_)
+                batch = next(iterator)
             X, Y, slens = batch
             #X = X.transpose(1, 2)
             X = X.unsqueeze(1)
@@ -464,7 +507,8 @@ def eval_epoch(dloader_, model, epoch, log_freq=1, writer=None, device='cpu',
             Y = Y.to(device)
             Y_ = model(X)
             Y = Y.view(-1, 1).repeat(1, Y_.size(2))
-            loss = F.nll_loss(Y_, Y)
+            loss = F.nll_loss(Y_.squeeze(-1), Y.squeeze(-1))
+            #loss = F.nll_loss(Y_, Y)
             eval_losses.append(loss.item())
             acc = accuracy(Y_, Y)
             eval_accs.append(acc)
@@ -495,14 +539,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--fe_cfg', type=str,
                         default=None)
-    parser.add_argument('--save_path', type=str, default='ckpt_mfcc')
+    parser.add_argument('--save_path', type=str, default='ckpt_nnet')
     parser.add_argument('--data_root', type=str, default=None)
-    parser.add_argument('--batch_size', type=int, default=20)
+    parser.add_argument('--num_workers', type=int, default=2)
+    parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--train_guia', type=str, default=None)
     parser.add_argument('--test_guia', type=str, default=None)
     parser.add_argument('--spk2idx', type=str, default=None)
     parser.add_argument('--log_freq', type=int, default=50)
-    parser.add_argument('--epoch', type=int, default=1000)
+    parser.add_argument('--epoch', type=int, default=150)
     parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--no-cuda', action='store_true', default=False)
@@ -515,8 +560,9 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--max_len', type=int, default=16000)
-    parser.add_argument('--hidden_size', type=int, default=256)
-    parser.add_argument('--emb_dim', type=int, default=256)
+    parser.add_argument('--hidden_size', type=int, default=2048)
+    parser.add_argument('--hidden_layers', type=int, default=1)
+    parser.add_argument('--emb_dim', type=int, default=100)
     parser.add_argument('--stats', type=str, default=None)
     parser.add_argument('--opt', type=str, default='adam')
     parser.add_argument('--sched_mode', type=str, default='plateau',
@@ -525,16 +571,16 @@ if __name__ == '__main__':
     parser.add_argument('--sched_step_size', type=int,
                         default=30, help='Number of epochs to apply '
                                           'a learning rate decay (Def: 30).')
-    parser.add_argument('--lrdec', type=float, default=0.1,
+    parser.add_argument('--lrdec', type=float, default=0.5,
                         help='Decay factor of learning rate after '
                              'patience epochs of valid accuracy not '
-                             'improving (Def: 0.1).')
+                             'improving (Def: 0.5).')
     parser.add_argument('--test_ckpt', type=str, default=None)
     parser.add_argument('--fe_ckpt', type=str, default=None)
     parser.add_argument('--plateau_mode', type=str, default='max',
                         help='LR Plateau scheduling mode; (1) max, (2) min '
                              '(Def: max).')
-    parser.add_argument('--model', type=str, default='cls',
+    parser.add_argument('--model', type=str, default='mlp',
                         help='(1) cls, (2) mlp (Def: cls).')
     parser.add_argument('--train', action='store_true', default=False)
     parser.add_argument('--test', action='store_true', default=False)
@@ -543,6 +589,8 @@ if __name__ == '__main__':
     parser.add_argument('--inorm_code', action='store_true', default=False)
     parser.add_argument('--uni', action='store_true', default=False,
                         help='Make RNN model unidirectional (Def: False).')
+    parser.add_argument('--return_sequence', action='store_true', default=False,
+                        help='Return sequence of hidden vectors for RNN (Def: False).')
     
     opts = parser.parse_args()
     
